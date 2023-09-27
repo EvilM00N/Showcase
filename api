@@ -1,0 +1,332 @@
+import requests
+import pandas as pd
+import json
+import constants.defs as defs
+import time as t
+
+from dateutil import parser
+from datetime import datetime as dt
+from datetime import timedelta
+from infrastructure.instrument_collection import instrumentCollection as ic
+from models.api_price import ApiPrice
+from models.open_trade import OpenTrade
+from simulation.analysis import HHLL, resistance_dict, average_close_values
+from simulation.trend import MA
+
+class OandaApi:
+
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update(defs.SECURE_HEADER)
+
+    def make_request(self, url, verb='get', code=200, params=None, data=None, headers=None):
+        full_url = f"{defs.OANDA_URL}/{url}"
+
+        if data is not None:
+            data = json.dumps(data)
+
+        try:
+            response = None
+            if verb == "get":
+                response = self.session.get(full_url, params=params, data=data, headers=headers)
+            if verb == "post":
+                response = self.session.post(full_url, params=params, data=data, headers=headers)
+            if verb == "put":
+                response = self.session.put(full_url, params=params, data=data, headers=headers)
+            
+            if response == None:
+                return False, {'error': 'verb not found'}
+
+            if response.status_code == code:
+                return True, response.json()
+            else:
+                return False, response.json()
+            
+        except Exception as error:
+            return False, {'Exception': error}
+
+    def get_account_ep(self, ep, data_key):
+        url = f"accounts/{defs.ACCOUNT_ID}/{ep}"
+        ok, data = self.make_request(url);
+
+        if ok == True and data_key in data:
+            return data[data_key]
+        else:
+            print("ERROR get_account_ep()", data)
+            return None
+
+    def get_account_summary(self):
+        return self.get_account_ep("summary", "account")
+
+    def get_account_instruments(self):
+        return self.get_account_ep("instruments", "instruments")
+    
+    def fetch_orderbook(self,pair_name,time = None, inputtime = None, entry_price = None):
+        url = f"instruments/{pair_name}/orderBook"
+
+        params = {}
+        if time is not None:
+            date_format = "%Y-%m-%dT%H:%M:%S.000Z"
+            time = time.replace(minute=0, second=0, microsecond=0)
+            params["time"] = dt.strftime(time,date_format)
+        
+        if inputtime is not None :
+            params["time"] = inputtime
+
+        t.sleep(1)
+        ok, data = self.make_request(url, params=params)
+
+        if ok == True and entry_price is not None:
+            increment = float(data['orderBook']['bucketWidth'])
+            for bucket in data['orderBook']['buckets']:
+                if abs(entry_price - float(bucket['price']))<increment:
+                    long = float(bucket['longCountPercent'])
+                    short = float(bucket['shortCountPercent'])
+                    if long>short:
+                        return "uptrend",long
+                    elif short>long:
+                        return "downtrend",short
+                    else:
+                        return "Error_nobias"
+
+        else:
+            print("ERROR fetch_orderBook()", params, data)
+            return None
+        
+
+    def fetch_candles(self, pair_name, count=10, granularity="H1",
+                            price="MBA", date_f=None, date_t=None):
+        url = f"instruments/{pair_name}/candles"
+        params = dict(
+            granularity = granularity,
+            price = price
+        )
+
+        if date_f is not None and date_t is not None:
+            date_format = "%Y-%m-%dT%H:%M:%SZ"
+            params["from"] = dt.strftime(date_f, date_format)
+            params["to"] = dt.strftime(date_t, date_format)
+        else:
+            params["count"] = count
+
+        ok, data = self.make_request(url, params=params)
+    
+        if ok == True and 'candles' in data:
+            return data['candles']
+        else:
+            print("ERROR fetch_candles()", params, data)
+            return None
+
+    def get_candles_df(self, pair_name, **kwargs):
+
+        data = self.fetch_candles(pair_name, **kwargs)
+
+        if data is None:
+            return None
+        if len(data) == 0:
+            return pd.DataFrame()
+        
+        prices = ['mid', 'bid', 'ask']
+        ohlc = ['o', 'h', 'l', 'c']
+        
+        final_data = []
+        for candle in data:
+            if candle['complete'] == False:
+                continue
+            new_dict = {}
+            new_dict['time'] = parser.parse(candle['time'])
+            new_dict['volume'] = candle['volume']
+            for p in prices:
+                if p in candle:
+                    for o in ohlc:
+                        new_dict[f"{p}_{o}"] = float(candle[p][o])
+            final_data.append(new_dict)
+        df = pd.DataFrame.from_dict(final_data)
+        return df
+
+    def last_complete_candle(self, pair_name, granularity):
+        df = self.get_candles_df(pair_name, granularity=granularity, count=10)
+        if df.shape[0] == 0:
+            return None
+        return df.iloc[-1].time
+    
+    def lastest_SGDtoUSD(self):
+        df = self.get_candles_df("USD_SGD", granularity="M1", count=5)
+        if df.shape[0] == 0:
+            return None
+        return df.iloc[-1].mid_c
+
+    
+
+    def collect_backtest_data(self, pair, granularity, TF, trade_date):
+        CANDLE_COUNT = 3000
+
+        INCREMENTS = {
+            'M5' : 5 * CANDLE_COUNT,
+            'M15' : 15 * CANDLE_COUNT,
+            'H1' : 60 * CANDLE_COUNT,
+            'H4' : 240 * CANDLE_COUNT,
+            'D' : 1440 * CANDLE_COUNT
+        }
+    
+        time_step = INCREMENTS[granularity]
+
+        if TF  == "LTF":
+            end_date = parser.parse(trade_date)+ timedelta(days=1)
+            from_date = end_date - timedelta(days=2)
+
+        elif TF == "HTF":
+
+            end_date = parser.parse(trade_date)
+            from_date = end_date - timedelta(days=4)
+
+        candle_dfs = []
+
+        to_date = from_date
+
+        while to_date < end_date:
+            to_date = from_date + timedelta(minutes=time_step)
+            if to_date > end_date:
+                to_date = end_date
+
+            candles = self.get_candles_df(
+                pair,
+                granularity=granularity, 
+                date_f = from_date,
+                date_t = to_date
+                )
+            t.sleep(1)
+
+            if candles is not None:
+                candle_dfs.append(candles)
+                print(f"{pair} {granularity} {from_date} {to_date} --> {candles.shape[0]} candles loaded")
+            else:
+                print(f"{pair} {granularity} {from_date} {to_date} --> NO CANDLES")
+            
+            from_date = to_date
+        
+        if len(candle_dfs) > 0:
+            final_df = pd.concat(candle_dfs)
+            final_df.reset_index(inplace= True)
+
+            if TF == "HTF":
+                trend_status = MA(final_df.copy())
+                DTF = HHLL(final_df)
+                Res_list = resistance_dict(DTF)
+
+
+            cols = ['time', 'mid_o', 'mid_h', 'mid_l', 'mid_c']
+            final_df = final_df[cols].copy()
+
+            final_df['time'] = final_df.time.dt.strftime("%y-%m-%d %H:%M")
+
+            if TF == "HTF":
+                return final_df.to_dict(orient='list'), Res_list, trend_status
+            
+            elif TF == "LTF":
+                return final_df.to_dict(orient='list')
+            
+        else:
+            print(f"{pair} {granularity} --> NO DATA SAVED!")
+
+
+
+        
+
+    def place_limit_order(self, pair_name: str,signal_time: dt ,  price: float, units: float, direction: int,
+                        stop_loss_pips: int = 15, take_profit_pips: int = 60):
+
+        url = f"accounts/{defs.ACCOUNT_ID}/orders"
+
+        instrument = ic.instruments_dict[pair_name]
+        units = round(units, instrument.tradeUnitsPrecision)
+        price = round(price, instrument.displayPrecision)
+        date_format = "%Y-%m-%dT%H:%M:%S.%fZ"
+        order_cancel_time = signal_time +timedelta(hours=23)
+        order_cancel_time  = order_cancel_time.strftime(date_format)
+        
+
+        if direction == defs.SELL:
+            units = units * -1   
+            stop_loss = price + stop_loss_pips*instrument.pipLocation
+            take_profit = price - take_profit_pips*instrument.pipLocation    
+
+        elif direction == defs.BUY:
+            stop_loss = price - stop_loss_pips*instrument.pipLocation
+            take_profit = price + take_profit_pips*instrument.pipLocation
+
+        
+
+        print("price = ",price, "stop_loss = ", stop_loss, "take_proft = ", take_profit)
+
+        data = dict(
+            order=dict(
+                units=str(units),
+                instrument=pair_name,
+                type="LIMIT",
+                price=str(price),
+                timeInForce = "GTD",
+                gtdTime= order_cancel_time
+            )
+        )
+
+        if stop_loss is not None:
+            sld = dict(price=str(round(stop_loss, instrument.displayPrecision)))
+            data['order']['guaranteedStopLossOnFill'] = sld
+
+        if take_profit is not None:
+            tpd = dict(price=str(round(take_profit, instrument.displayPrecision)))
+            data['order']['takeProfitOnFill'] = tpd
+
+        print(data)
+
+        ok, response = self.make_request(url, verb="post", data=data, code=201)
+
+        #print(ok, response)
+        print("response =", response)
+
+        if ok == True and 'orderCreateTransaction' in response:
+            return response['orderCreateTransaction']['requestID']
+        else:
+            return None
+            
+    def close_trade(self, trade_id):
+        url = f"accounts/{defs.ACCOUNT_ID}/trades/{trade_id}/close"
+        ok, _ = self.make_request(url, verb="put", code=200)
+
+        if ok == True:
+            print(f"Closed {trade_id} successfully")
+        else:
+            print(f"Failed to close {trade_id}")
+
+        return ok
+
+
+
+
+    def get_pending_orders_byINSTRUMENT(self, pair):
+        url = f"accounts/{defs.ACCOUNT_ID}/pendingOrders"
+        ok, response = self.make_request(url)
+
+        if ok == True and 'orders' in response:
+            #print("res=",response)
+            count=0
+            for x in response['orders']:
+                if x['instrument'] == pair:
+                    count+=1
+            return count
+        else:
+            return None
+        
+    def get_opentrades_byINSTRUMENT(self,pair):
+        url = f"accounts/{defs.ACCOUNT_ID}/openTrades"
+        ok, response = self.make_request(url)
+
+        if ok == True and 'trades' in response:
+            count=0
+            for x in response['trades']:
+                if x['instrument'] == pair:
+                    count+=1
+            return count
+        else:
+            return None
