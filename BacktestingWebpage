@@ -1,0 +1,115 @@
+import React, { useEffect, useState } from 'react';
+import endPoints from '../app/api';
+import Button from '../components/Button';
+import Select from '../components/Select';
+import InputField from '../components/InputField';
+import TitleHead from '../components/TitleHead';
+import LTFPriceChart from '../components/LTFPriceChart';
+import HTFPriceChart from '../components/HTFPriceChart';
+
+function Backtest() {
+    
+    const [ selectedPair, setSelectedPair ] = useState(null);
+    const [ selectedFirstGran, setSelectedFirstGran ] = useState(null);
+    const [ selectedSecondGran, setSelectedSecondGran ] = useState(null);
+    const [ options, setOptions ] = useState(null);
+    const [ loading, setLoading ] = useState(true);
+    const [inputValue, setInputValue] = useState('');
+    const [ LTFpriceData, setLTFPriceData ] = useState(null);
+    const [ HTFpriceData, setHTFPriceData ] = useState(null);
+    const [ HTFResList, setHTFResList ] = useState(null);
+    const [ Trend, setTrend ] = useState(null);
+    //const [ LTFResList, setLTFResList ] = useState(null);
+
+    useEffect(() => {
+        loadOptions();
+      }, []);
+    
+
+    
+
+    const loadOptions = async () => {
+        const data = await endPoints.options();
+        setOptions(data);
+        setSelectedFirstGran(data.granularities[0].value);
+        setSelectedSecondGran(data.granularities[0].value);
+        setSelectedPair(data.pairs[0].value);
+        setLoading(false);
+      }
+
+
+
+    const HTFcharting = async () => {
+        const [HTF_price_data, HTF_res_list, trend] = await endPoints.backtestdata(selectedPair,selectedSecondGran, "HTF", inputValue);
+        setHTFPriceData(HTF_price_data);
+        setTrend(trend);
+        //console.log("HTFchartData: ");
+        setHTFResList(HTF_res_list);
+        setLoading(false);
+      }
+
+    const LTFcharting = async () => {
+        const LTF_price_data = await endPoints.backtestdata(selectedPair,selectedFirstGran, "LTF", inputValue);
+        setLTFPriceData(LTF_price_data);
+        //console.log("LTFchartData: ", LTF_price_data);
+        //setLTFResList(LTF_res_list);
+        setLoading(false);
+      }
+
+
+    if(loading === true) return <h1>Loading...</h1>
+    
+  return (
+    <div>
+        <TitleHead title ="Settings" />
+        <div className="segment options">
+        <Select 
+          name="Currency"
+          title="Select currency:"
+          options={options.pairs}
+          defaultValue={selectedPair}
+          onSelected={setSelectedPair}
+        />
+        <Select 
+          name="LTFGranularity"
+          title="Select LTF granularity:"
+          options={options.granularities}
+          defaultValue={selectedFirstGran}
+          onSelected={setSelectedFirstGran}
+        />
+        <Select 
+          name="HTFGranularity"
+          title="Select HTF granularity:"
+          options={options.granularities}
+          defaultValue={selectedSecondGran}
+          onSelected={setSelectedSecondGran}
+        />
+        <InputField
+          name="Trade_Date"
+          title="Enter Trade Date:"
+          defaultValue={inputValue}
+          onSelected={setInputValue}
+        />
+        <Button text="Load" handleClick={() => {HTFcharting(); LTFcharting();}} />
+        </div>
+
+        <TitleHead title ="LTF Candle Chart" />
+        { LTFpriceData && <LTFPriceChart
+        selectedPair={selectedPair}
+        selectedGranularity={selectedFirstGran}
+        priceData={LTFpriceData}
+        resList={HTFResList}
+      />}
+
+        <TitleHead title ="HTF Candle Chart" />
+        { HTFpriceData && <HTFPriceChart
+        selectedPair={selectedPair}
+        selectedGranularity={selectedSecondGran}
+        priceData={HTFpriceData}
+        resList={HTFResList}
+      />}
+    </div>
+  )
+}
+
+export default Backtest
